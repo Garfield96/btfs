@@ -7,7 +7,7 @@ license = "MIT OR Apache-2.0"
 readme = "README.md"
 description = "A simple in-memory FS."
 keywords = ["mem", "fs", "btree", "file-system"]
-categories = ["file-system", "concurrency", "data-structures", "os"]
+categories = ["filesystem", "concurrency", "data-structures", "os"]
 
 homepage = "https://github.com/gz/btfs"
 repository = "https://github.com/gz/btfs"
