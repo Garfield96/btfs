@@ -1,15 +1,51 @@
-# bpfs
+# btfs
 
-## About
-bpfs is a an in-memory filesystem written in Rust and built on the [Rust-FUSE](https://github.com/zargony/rust-fuse) library
+A basic simple in-memory file-system using b-trees.
 
-## Usage
-The program takes one argument; the location for the mount.  To mount the filesystem at /tmp/bpfs directory:
+## FUSE Example
 
-``./bpfs /tmp/bpfs`` or 
-``cargo run /tmp/bpfs/``
+Set up FUSE:
+```
+$ apt-get install fuse libfuse-dev
 
-To unmount a filesystem, use any arbitrary unmount/eject method of your OS.
+# Make sure fuse.conf has allow_root and user_allow_other set:
+$ cat /etc/fuse.conf
+allow_root
+user_allow_other
+```
 
-## To-Do
-File permissions and ownership, extended attributes, stat, and hard linking aren't implemented
+Test the system:
+```
+$ RUST_LOG=trace cargo run --bin fuse /tmp/test
+```
+
+Unmount:
+```
+$ umount /tmp/test
+```
+
+## Testing with filebench
+
+Installing filebench:
+
+```
+$ git clone https://github.com/filebench/filebench.git
+$ libtoolize
+$ aclocal
+$ autoheader
+$ automake --add-missing
+$ autoconf
+$ ./configure
+$ make
+```
+
+Running a benchmark:
+```
+$ mkdir -p /tmp/fbtest
+$ cargo run --release --bin fuse -- /tmp/fbtest/ &
+
+$ echo 0 > /proc/sys/kernel/randomize_va_space
+$ ./filebench -f randomrw.f
+
+$ umount /tmp/fbtest
+```
