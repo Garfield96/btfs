@@ -1,12 +1,12 @@
 //! A simple implementation of an in-memory files-sytem written in Rust using the BTreeMap
 //! data-structure.
 //!
-//! This code is inspired from https://github.com/bparli/bpfs and was modified to work 
+//! This code is inspired from https://github.com/bparli/bpfs and was modified to work
 //! with node-replication for benchmarking.
 
 use fuse::{
-    FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
-    ReplyEntry, ReplyOpen, ReplyWrite, Request,
+    Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
+    ReplyOpen, ReplyWrite, Request,
 };
 use libc::{c_int, EEXIST, EINVAL, ENOENT, ENOTEMPTY};
 use std::collections::BTreeMap;
@@ -17,7 +17,11 @@ use log::{debug, error, info, trace};
 
 const TTL: Timespec = Timespec { sec: 1, nsec: 0 };
 
-type InodeId = u64;
+pub type InodeId = u64;
+
+// Re-export reused structs from fuse:
+pub use fuse::FileAttr;
+pub use fuse::FileType;
 
 #[derive(Debug, Eq, PartialEq, Clone, Copy)]
 pub enum Error {
@@ -154,7 +158,7 @@ impl MemFilesystem {
     }
 
     /// Generates inode numbers.
-    pub fn get_next_ino(&mut self) -> u64 {
+    fn get_next_ino(&mut self) -> u64 {
         self.next_inode += 1;
         self.next_inode
     }
@@ -484,11 +488,11 @@ impl Filesystem for MemFilesystem {
             Ok(attr) => {
                 info!("getattr reply with attrs = {:?}", attr);
                 reply.attr(&TTL, attr)
-            },
+            }
             Err(e) => {
                 error!("getattr reply with errno = {:?}", e);
                 reply.error(e.into())
-            },
+            }
         }
     }
 
