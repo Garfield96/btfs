@@ -9,6 +9,10 @@ description = "A simple in-memory FS."
 keywords = ["mem", "fs", "btree", "file-system"]
 categories = ["file-system", "concurrency", "data-structures", "os"]
 
+homepage = "https://github.com/gz/btfs"
+repository = "https://github.com/gz/btfs"
+documentation = "https://docs.rs/btfs"
+
 [dependencies]
 log = "0.4"
 fuse = "0.3.1"
