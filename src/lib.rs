@@ -69,7 +69,7 @@ impl MemFile {
     pub fn new() -> MemFile {
         MemFile { bytes: Vec::new() }
     }
-    
+
     fn size(&self) -> u64 {
         self.bytes.len() as u64
     }
@@ -154,18 +154,18 @@ impl MemFilesystem {
     }
 
     /// Generates inode numbers.
-    fn get_next_ino(&mut self) -> u64 {
+    pub fn get_next_ino(&mut self) -> u64 {
         self.next_inode += 1;
         self.next_inode
     }
 
-    fn getattr(&mut self, ino: u64) -> Result<&FileAttr, Error> {
+    pub fn getattr(&mut self, ino: u64) -> Result<&FileAttr, Error> {
         debug!("getattr(ino={})", ino);
         self.attrs.get(&ino).ok_or(Error::NoEntry)
     }
 
     /// Updates the attributes on an inode with values in `new_attrs`.
-    fn setattr(&mut self, ino: u64, new_attrs: SetAttrRequest) -> Result<&FileAttr, Error> {
+    pub fn setattr(&mut self, ino: u64, new_attrs: SetAttrRequest) -> Result<&FileAttr, Error> {
         debug!("setattr(ino={}, new_attrs={:?})", ino, new_attrs);
         let mut file_attrs = self.attrs.get_mut(&ino).ok_or(Error::NoEntry)?;
 
@@ -194,7 +194,7 @@ impl MemFilesystem {
         Ok(file_attrs)
     }
 
-    fn readdir(
+    pub fn readdir(
         &mut self,
         ino: InodeId,
         _fh: u64,
@@ -216,7 +216,7 @@ impl MemFilesystem {
         })
     }
 
-    fn lookup(&mut self, parent: u64, name: &OsStr) -> Result<&FileAttr, Error> {
+    pub fn lookup(&mut self, parent: u64, name: &OsStr) -> Result<&FileAttr, Error> {
         let name_str = name.to_str().unwrap();
         debug!("lookup(parent={}, name={})", parent, name_str);
 
@@ -225,7 +225,7 @@ impl MemFilesystem {
         self.attrs.get(inode).ok_or(Error::NoEntry)
     }
 
-    fn rmdir(&mut self, parent: u64, name: &OsStr) -> Result<(), Error> {
+    pub fn rmdir(&mut self, parent: u64, name: &OsStr) -> Result<(), Error> {
         let name_str = name.to_str().unwrap();
         debug!("rmdir(parent={}, name={})", parent, name_str);
 
@@ -247,7 +247,7 @@ impl MemFilesystem {
         }
     }
 
-    fn mkdir(&mut self, parent: u64, name: &OsStr, _mode: u32) -> Result<&FileAttr, Error> {
+    pub fn mkdir(&mut self, parent: u64, name: &OsStr, _mode: u32) -> Result<&FileAttr, Error> {
         let name_str = name.to_str().unwrap();
         debug!("mkdir(parent={}, name={})", parent, name_str);
 
@@ -290,7 +290,7 @@ impl MemFilesystem {
         }
     }
 
-    fn unlink(&mut self, parent: u64, name: &OsStr) -> Result<(), Error> {
+    pub fn unlink(&mut self, parent: u64, name: &OsStr) -> Result<(), Error> {
         let name_str = name.to_str().unwrap();
         debug!("unlink(parent={}, name={})", parent, name_str);
 
@@ -319,7 +319,7 @@ impl MemFilesystem {
         Ok(())
     }
 
-    fn create(
+    pub fn create(
         &mut self,
         parent: u64,
         name: &OsStr,
@@ -385,7 +385,7 @@ impl MemFilesystem {
         }
     }
 
-    fn write(
+    pub fn write(
         &mut self,
         ino: u64,
         fh: u64,
@@ -420,7 +420,7 @@ impl MemFilesystem {
         Ok(size)
     }
 
-    fn read(&mut self, ino: u64, fh: u64, offset: i64, size: u32) -> Result<&[u8], Error> {
+    pub fn read(&mut self, ino: u64, fh: u64, offset: i64, size: u32) -> Result<&[u8], Error> {
         debug!(
             "read(ino={}, fh={}, offset={}, size={})",
             ino, fh, offset, size
@@ -437,7 +437,7 @@ impl MemFilesystem {
     }
 
     /// Rename a file.
-    fn rename(
+    pub fn rename(
         &mut self,
         parent: u64,
         current_name: &OsStr,
