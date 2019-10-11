@@ -4,13 +4,15 @@
 //! This code is inspired from https://github.com/bparli/bpfs and was modified to work
 //! with node-replication for benchmarking.
 
+use std::collections::BTreeMap;
+use std::ffi::OsStr;
+use std::iter;
+
 use fuse::{
     Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
     ReplyOpen, ReplyWrite, Request,
 };
 use libc::{c_int, EEXIST, EINVAL, ENOENT, ENOTEMPTY};
-use std::collections::BTreeMap;
-use std::ffi::OsStr;
 use time::Timespec;
 
 use log::{debug, error, info, trace};
@@ -79,17 +81,28 @@ impl MemFile {
     }
 
     fn update(&mut self, new_bytes: &[u8], offset: i64) -> u64 {
-        let mut counter = offset as usize;
-        for &byte in new_bytes {
-            self.bytes.insert(counter, byte);
-            counter += 1;
+        let offset: usize = offset as usize;
+
+        if offset >= self.bytes.len() {
+            // extend with zeroes until we are at least at offset
+            self.bytes
+                .extend(iter::repeat(0).take(offset - self.bytes.len()));
         }
+
+        if offset + new_bytes.len() > self.bytes.len() {
+            self.bytes.splice(offset.., new_bytes.iter().cloned());
+        } else {
+            self.bytes
+                .splice(offset..offset + new_bytes.len(), new_bytes.iter().cloned());
+        }
+
         debug!(
             "update(): len of new bytes is {}, total len is {}, offset was {}",
             new_bytes.len(),
             self.size(),
             offset
         );
+
         new_bytes.len() as u64
     }
 
@@ -655,5 +668,28 @@ impl Filesystem for MemFilesystem {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e.into()),
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    #[test]
+    fn memfs_update() {
+        let mut f = MemFile::new();
+        f.update(&[0, 1, 2, 3, 4, 5, 6, 7, 8], 0);
+        assert_eq!(f.size(), 9);
+
+        f.update(&[0, 0], 0);
+        assert_eq!(f.size(), 9);
+        assert_eq!(f.bytes, &[0, 0, 2, 3, 4, 5, 6, 7, 8]);
+
+        f.update(&[1, 1], 8);
+        assert_eq!(f.bytes, &[0, 0, 2, 3, 4, 5, 6, 7, 1, 1]);
+        assert_eq!(f.size(), 10);
+
+        f.update(&[2, 2], 13);
+        assert_eq!(f.bytes, &[0, 0, 2, 3, 4, 5, 6, 7, 1, 1, 0, 0, 0, 2, 2]);
+        assert_eq!(f.size(), 15);
     }
 }
