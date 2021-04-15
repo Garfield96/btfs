@@ -26,9 +26,10 @@ $ umount /tmp/test
 
 ## Testing with filebench
 
-Installing filebench:
+Installing filebench ([https://github.com/filebench/filebench](https://github.com/filebench/filebench)):
 
 ```
+$ sudo apt-get install bison flex
 $ git clone https://github.com/filebench/filebench.git
 $ libtoolize
 $ aclocal
@@ -44,7 +45,7 @@ Running a benchmark:
 $ mkdir -p /tmp/fbtest
 $ cargo run --release --bin fuse -- /tmp/fbtest/ &
 
-$ echo 0 > /proc/sys/kernel/randomize_va_space
+$ sudo sh -c "echo 0 > /proc/sys/kernel/randomize_va_space"
 $ ./filebench -f randomrw.f
 
 $ umount /tmp/fbtest
