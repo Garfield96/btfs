@@ -599,7 +599,7 @@ impl Filesystem for MemFilesystem {
 
     fn open(&mut self, _req: &Request, _ino: u64, flags: u32, reply: ReplyOpen) {
         trace!("open(ino={}, _flags={})", _ino, flags);
-        reply.opened(0, 0);
+        reply.opened(0, flags);
     }
 
     fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
