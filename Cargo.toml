@@ -19,3 +19,5 @@ fuse = "0.3.1"
 libc = "0.2.42"
 time = "0.1.40"
 env_logger = "0.8"
+rusqlite = {version="0.25.1", features = ["blob"]}
+
