@@ -11,7 +11,7 @@ use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 use std::str::from_utf8;
 use std::time::{SystemTime, UNIX_EPOCH};
-use std::{fs, iter, process};
+use std::{fs, process};
 
 use fuse::{
     Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
@@ -23,7 +23,9 @@ pub use fuse::FileType;
 
 use libc::{c_int, EEXIST, EINVAL, ENOENT, ENOTEMPTY};
 use log::{debug, error, info, trace};
-use rusqlite::{params, Connection, DatabaseName, Result};
+use regex::Regex;
+use rusqlite::types::ValueRef;
+use rusqlite::{params, Connection, DatabaseName, Result, Rows};
 use time::Timespec;
 
 const TTL: Timespec = Timespec { sec: 1, nsec: 0 };
@@ -95,55 +97,6 @@ pub struct SetAttrRequest {
     pub flags: Option<u32>,
 }
 
-#[derive(Clone, Debug)]
-pub struct MemFile {
-    bytes: Vec<u8>,
-    xattr: BTreeMap<String, String>,
-}
-
-impl MemFile {
-    pub fn new() -> MemFile {
-        MemFile {
-            bytes: Vec::new(),
-            xattr: BTreeMap::new(),
-        }
-    }
-
-    fn size(&self) -> u64 {
-        self.bytes.len() as u64
-    }
-
-    fn update(&mut self, new_bytes: &[u8], offset: i64) -> u64 {
-        let offset: usize = offset as usize;
-
-        if offset >= self.bytes.len() {
-            // extend with zeroes until we are at least at offset
-            self.bytes
-                .extend(iter::repeat(0).take(offset - self.bytes.len()));
-        }
-
-        if offset + new_bytes.len() > self.bytes.len() {
-            self.bytes.splice(offset.., new_bytes.iter().cloned());
-        } else {
-            self.bytes
-                .splice(offset..offset + new_bytes.len(), new_bytes.iter().cloned());
-        }
-
-        debug!(
-            "update(): len of new bytes is {}, total len is {}, offset was {}",
-            new_bytes.len(),
-            self.size(),
-            offset
-        );
-
-        new_bytes.len() as u64
-    }
-
-    fn truncate(&mut self, size: u64) {
-        self.bytes.truncate(size as usize);
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct Inode {
     name: String,
@@ -162,7 +115,6 @@ impl Inode {
 }
 
 pub struct MemFilesystem {
-    files: BTreeMap<u64, MemFile>,
     attrs: BTreeMap<u64, FileAttr>,
     inodes: BTreeMap<u64, Inode>,
     next_inode: u64,
@@ -226,8 +178,6 @@ impl MemFilesystem {
         )
         .unwrap();
 
-        let files = BTreeMap::new();
-
         let root = Inode::new("/".to_string(), 1 as u64);
 
         let mut attrs = BTreeMap::new();
@@ -258,7 +208,6 @@ impl MemFilesystem {
             .unwrap();
 
         MemFilesystem {
-            files: files,
             attrs: attrs,
             inodes: inodes,
             next_inode: 2,
@@ -309,17 +258,30 @@ impl MemFilesystem {
                 flags: row.get(13)?,
             })
         }) {
-            Ok(res) => Ok(res),
+            Ok(mut res) => {
+                stmt.finalize();
+                if res.flags == 1 {
+                    res.size = self.read(ino, 0, 0, 0).unwrap().len() as u64;
+                }
+                Ok(res)
+            }
             Err(_) => Err(Error::NoEntry),
         }
-
-        //self.attrs.get(&ino).ok_or(Error::NoEntry)
     }
 
     /// Retrieves the extended attributes of a file.
     pub fn getxattr(&mut self, ino: u64, name: &OsStr) -> Result<String, Error> {
         let name = name.to_str().unwrap();
         debug!("getxattr(ino={}, name={})", ino, name);
+
+        if name.starts_with("sql#") {
+            let mut stmt = self
+                .conn
+                .prepare(name.strip_prefix("sql#").unwrap())
+                .unwrap();
+            let mut table_content = stmt.query([]).unwrap();
+            return Ok(MemFilesystem::rows_to_csv(&mut table_content));
+        }
 
         let mut stmt = self
             .conn
@@ -382,9 +344,9 @@ impl MemFilesystem {
     pub fn setattr(&mut self, ino: u64, new_attrs: SetAttrRequest) -> Result<FileAttr, Error> {
         debug!("setattr(ino={}, new_attrs={:?})", ino, new_attrs);
         if new_attrs.size.is_some() {
-            let mut blob =
-                self.conn
-                    .blob_open(DatabaseName::Main, "inodes", "data", ino as i64, false);
+            let blob = self
+                .conn
+                .blob_open(DatabaseName::Main, "inodes", "data", ino as i64, false);
             if blob.is_err() {
                 return Err(Error::NoEntry);
             }
@@ -513,19 +475,6 @@ impl MemFilesystem {
         debug!("Results: {:?}", entries);
 
         Ok(entries)
-
-        // Rust version
-        // self.inodes.get(&ino).map_or(Err(Error::NoEntry), |inode| {
-        //     entries.push((inode.parent, FileType::Directory, String::from("..")));
-        //
-        //     for (child, child_ino) in inode.children.iter() {
-        //         let child_attrs = &self.attrs.get(child_ino).unwrap();
-        //         trace!("\t inode={}, child={}", child_ino, child);
-        //         entries.push((child_attrs.ino, child_attrs.kind, String::from(child)));
-        //     }
-        //
-        //     Ok(entries)
-        // })
     }
 
     pub fn lookup(&mut self, parent: u64, name: &OsStr) -> Result<FileAttr, Error> {
@@ -569,11 +518,6 @@ impl MemFilesystem {
             Ok(res) => Ok(res),
             Err(_) => Err(Error::NoEntry),
         }
-
-        // Rust version
-        // let parent_inode = self.inodes.get(&parent).ok_or(Error::NoEntry)?;
-        // let inode = parent_inode.children.get(name_str).ok_or(Error::NoEntry)?;
-        // self.attrs.get(inode).ok_or(Error::NoEntry)
     }
 
     pub fn rmdir(&mut self, parent: u64, name: &OsStr) -> Result<(), Error> {
@@ -582,9 +526,27 @@ impl MemFilesystem {
 
         let mut tx = self.conn.transaction().unwrap();
         {
-            tx.execute("\
+            let number_of_children = tx.query_row("SELECT count(*) FROM tree WHERE parent = (SELECT inode FROM tree WHERE parent = ?1 AND name = ?2)",
+            params![parent, name_str], |row| row.get::<_,u64>(0) );
+            match number_of_children {
+                Ok(n) => {
+                    if n > 0 {
+                        return Err(Error::NotEmpty)
+                    }
+                },
+                Err(_) => {
+                    return Err(Error::NoEntry)
+                }
+            }
+            let changed_rows = tx.execute("\
         UPDATE inodes SET nlink = nlink - 1 WHERE inode = (SELECT inode FROM tree WHERE parent = ?1 AND name = ?2);",
                               params![parent, name_str]).unwrap();
+
+            if changed_rows == 0 {
+                tx.rollback();
+                return Err(Error::NoEntry);
+            }
+
             tx.execute(
                 "\
         DELETE FROM tree WHERE parent = ?1 AND name = ?2;",
@@ -598,135 +560,30 @@ impl MemFilesystem {
         Ok(())
     }
 
-    pub fn mkdir(&mut self, parent: u64, name: &OsStr, _mode: u32) -> Result<FileAttr, Error> {
+    pub fn mkdir(&mut self, parent: u64, name: &OsStr, mode: u32) -> Result<FileAttr, Error> {
         let name_str = name.to_str().unwrap();
         debug!("mkdir(parent={}, name={})", parent, name_str);
 
-        // let new_inode_nr = self.get_next_ino();
-        // let parent_ino = self.inodes.get_mut(&parent).ok_or(Error::ParentNotFound)?;
-
-        let new_inode_nr: u64 = self
-            .conn
-            .query_row(
-                "SELECT max(inode) as max_index FROM inodes",
-                [],
-                |max_index| Ok(max_index.get::<_, u64>(0)?),
-            )
-            .unwrap()
-            + 1;
-
-        let mut tx = self.conn.transaction().unwrap();
-        {
-            let err = tx.execute(
-                "\
-        INSERT INTO inodes (inode, atime, mtime, ctime, crtime, kind) \
-        SELECT ?3, ?2, ?2, ?2, ?2, ?1 \
-        WHERE EXISTS (SELECT * FROM inodes WHERE inodes.inode = ?4 AND inodes.kind = ?5)",
-                params![
-                    FileTypeToInt(FileType::Directory),
-                    SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs(),
-                    new_inode_nr,
-                    parent,
-                    FileTypeToInt(FileType::Directory)
-                ],
-            );
-            if err.unwrap() == 0 {
-                tx.rollback();
-                return Err(Error::ParentNotFound);
-            }
-
-            let err = tx.execute(
-                "\
-        INSERT INTO tree (inode, parent, name)\
-        SELECT ?1, ?2, ?3 \
-        WHERE NOT EXISTS (SELECT * FROM tree WHERE tree.name = ?3 AND parent = ?2)",
-                params![new_inode_nr, parent, name_str.to_string()],
-            );
-            if err.unwrap() == 0 {
-                tx.rollback();
-                return Err(Error::AlreadyExists);
-            }
-        }
-        tx.commit();
-        self.getattr(new_inode_nr)
-        // if !parent_ino.children.contains_key(name_str) {
-        //     let ts = time::now().to_timespec();
-        //     let attr = FileAttr {
-        //         ino: new_inode_nr,
-        //         size: 0,
-        //         blocks: 0,
-        //         atime: ts,
-        //         mtime: ts,
-        //         ctime: ts,
-        //         crtime: ts,
-        //         kind: FileType::Directory,
-        //         perm: 0o644,
-        //         nlink: 0,
-        //         uid: 0,
-        //         gid: 0,
-        //         rdev: 0,
-        //         flags: 0,
-        //     };
-        //
-        //     parent_ino
-        //         .children
-        //         .insert(name_str.to_string(), new_inode_nr);
-        //     self.attrs.insert(new_inode_nr, attr);
-        //     self.inodes
-        //         .insert(new_inode_nr, Inode::new(name_str.to_string(), parent));
-        //
-        //     let stored_attr = self
-        //         .attrs
-        //         .get(&new_inode_nr)
-        //         .expect("Shouldn't fail we just inserted it");
-        //     Ok(stored_attr)
-        // } else {
-        //     // A child with the given name already exists
-        //     Err(Error::AlreadyExists)
-        // }
+        self.create_entry(parent, 0, name_str, mode, FileType::Directory)
     }
 
     pub fn unlink(&mut self, parent: u64, name: &OsStr) -> Result<(), Error> {
         let name_str = name.to_str().unwrap();
         debug!("unlink(parent={}, name={})", parent, name_str);
 
-        // let parent_ino = self.inodes.get_mut(&parent).ok_or(Error::ParentNotFound)?;
-        // trace!("parent is {} for name={}", parent_ino.name, name_str);
-        //
-        // let old_ino = parent_ino
-        //     .children
-        //     .remove(&name_str.to_string())
-        //     .ok_or(Error::NoEntry)?;
-        //
-        // let attr = self
-        //     .attrs
-        //     .remove(&old_ino)
-        //     .expect("Inode needs to be in `attrs`.");
-        //
-        // if attr.kind == FileType::RegularFile {
-        //     self.files
-        //         .remove(&old_ino)
-        //         .expect("Regular file inode needs to be in `files`.");
-        // }
-        //
-        // self.inodes
-        //     .remove(&old_ino)
-        //     .expect("Child inode (to be unlinked) needs to in `inodes`.");
-
-        let mut tx = self.conn.transaction().unwrap();
+        let tx = self.conn.transaction().unwrap();
         {
-            tx.execute("\
+            let changed_rows = tx.execute("\
         UPDATE inodes SET nlink = nlink - 1 WHERE inode = (SELECT inode FROM tree WHERE parent = ?1 AND name = ?2);",
-                              params![parent, name_str]).unwrap();
-            tx.execute(
-                "\
+                               params![parent, name_str]).unwrap();
+            if changed_rows == 0 {
+                tx.rollback();
+                return Err(Error::NoEntry);
+            }
+            tx.execute("\
         DELETE FROM tree WHERE parent = ?1 AND name = ?2;",
                 params![parent, name_str],
-            )
-            .unwrap();
+            ).unwrap();
             tx.execute("DELETE FROM inodes WHERE nlink = 0", [])
                 .unwrap();
         }
@@ -747,6 +604,17 @@ impl MemFilesystem {
             parent, name_str, mode, flags,
         );
 
+        self.create_entry(parent, flags, name_str, mode, FileType::RegularFile)
+    }
+
+    fn create_entry(
+        &mut self,
+        parent: u64,
+        flags: u32,
+        name_str: &str,
+        mode: u32,
+        file_type: FileType,
+    ) -> Result<FileAttr, Error> {
         let new_inode_nr: u64 = self
             .conn
             .query_row(
@@ -758,20 +626,23 @@ impl MemFilesystem {
             + 1;
 
         let tx = self.conn.transaction().unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         let err = tx.execute(
             "\
-        INSERT INTO inodes (inode, atime, mtime, ctime, crtime, kind) \
-        SELECT ?3, ?2, ?2, ?2, ?2, ?1 \
+        INSERT INTO inodes (inode, atime, mtime, ctime, crtime, kind, flags, perm) \
+        SELECT ?3, ?2, ?2, ?2, ?2, ?1, ?6, ?7 \
         WHERE EXISTS (SELECT * FROM inodes WHERE inodes.inode = ?4 AND inodes.kind = ?5)",
             params![
-                FileTypeToInt(FileType::RegularFile),
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs(),
+                FileTypeToInt(file_type),
+                now,
                 new_inode_nr,
                 parent,
-                FileTypeToInt(FileType::Directory)
+                FileTypeToInt(FileType::Directory),
+                flags,
+                mode
             ],
         );
         if err.unwrap() == 0 {
@@ -791,60 +662,26 @@ impl MemFilesystem {
             return Err(Error::AlreadyExists);
         }
         tx.commit();
-        self.getattr(new_inode_nr)
-        // match parent_ino.children.get_mut(&name_str.to_string()) {
-        //     Some(child_ino) => {
-        //         let attrs = self
-        //             .attrs
-        //             .get(&child_ino)
-        //             .expect("Existing child inode needs to be in `attrs`.");
-        //         Ok(attrs)
-        //     }
-        //     None => {
-        //         trace!(
-        //             "create file not found( parent={}, name={})",
-        //             parent,
-        //             name_str
-        //         );
-        //
-        //         let ts = time::now().to_timespec();
-        //         self.attrs.insert(
-        //             new_inode_nr,
-        //             FileAttr {
-        //                 ino: new_inode_nr,
-        //                 size: 0,
-        //                 blocks: 0,
-        //                 atime: ts,
-        //                 mtime: ts,
-        //                 ctime: ts,
-        //                 crtime: ts,
-        //                 kind: FileType::RegularFile,
-        //                 perm: 0o644,
-        //                 nlink: 0,
-        //                 uid: 0,
-        //                 gid: 0,
-        //                 rdev: 0,
-        //                 flags: 0,
-        //             },
-        //         );
-        //         self.files.insert(new_inode_nr, MemFile::new());
-        //         parent_ino
-        //             .children
-        //             .insert(name_str.to_string(), new_inode_nr);
-        //         self.inodes
-        //             .insert(new_inode_nr, Inode::new(name_str.to_string(), parent));
-        //
-        //         let stored_attr = self
-        //             .attrs
-        //             .get(&new_inode_nr)
-        //             .expect("Shouldn't fail we just inserted it.");
-        //
-        //         self.conn.execute("INSERT INTO files (ino, name) VALUES (?1, ?2)",
-        //                           params![new_inode_nr, name_str]);
-        //
-        //         Ok(stored_attr)
-        //     }
-        // }
+        let ts_now = Timespec {
+            sec: now as i64,
+            nsec: 0,
+        };
+        Ok(FileAttr {
+            ino: new_inode_nr,
+            size: 0,
+            blocks: 0,
+            atime: ts_now,
+            mtime: ts_now,
+            ctime: ts_now,
+            crtime: ts_now,
+            kind: file_type,
+            perm: 0o644,
+            nlink: 1,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+            flags,
+        })
     }
 
     pub fn write(
@@ -859,6 +696,52 @@ impl MemFilesystem {
 
         let mut size = 0;
 
+        // Structured Files
+        let query_result = self.conn.query_row(
+            "SELECT parent, name FROM tree WHERE inode = ?1",
+            params![ino],
+            |row| {
+                Ok((
+                    row.get::<_, u64>(0).unwrap(),
+                    row.get::<_, String>(1).unwrap(),
+                ))
+            },
+        );
+
+        let mut parent;
+        let mut file_name;
+        match query_result {
+            Ok((p, n)) => {
+                parent = p;
+                file_name = n;
+            }
+            Err(_) => return Err(Error::NoEntry),
+        }
+
+        if file_name.ends_with(".sql") {
+            let re = Regex::new(r"CREATE TABLE ([[:alpha:]]+)").unwrap();
+            let data_str = String::from_utf8_lossy(data);
+            for cap in re.captures_iter(data_str.as_ref()) {
+                let f = self.create(parent, (&cap[1]).as_ref(), 0, 1);
+                let ino_str = format!("{}", ino);
+                self.write(f.unwrap().ino, 0, 0, ino_str.as_bytes(), 1);
+                println!("{}", &cap[1]);
+            }
+            match self.conn.execute_batch(data_str.as_ref()) {
+                Ok(_) => {}
+                Err(e) => {
+                    println!("{}", e);
+                    return Err(Error::InvalidInput);
+                }
+            };
+        }
+
+        // Read csv
+
+        // CREATE VIRTUAL TABLE vtab USING csv('<file>', HAS_HEADERS);
+        // CREATE TABLE <table> AS SELECT * from vtab;
+
+        // Regular Files
         let mut tx = self.conn.transaction().unwrap();
         {
             let mut blob = tx.blob_open(DatabaseName::Main, "inodes", "data", ino as i64, false);
@@ -914,17 +797,60 @@ impl MemFilesystem {
             ino, fh, offset, size
         );
 
-        match self
-            .conn
-            .blob_open(DatabaseName::Main, "inodes", "data", ino as i64, false)
-        {
-            Ok(blob) => {
-                let mut buf = vec![b'0'; size as usize];
-                blob.read_at(buf.as_mut(), offset as usize);
-                Ok(buf)
+        let query_result = self.conn.query_row("SELECT flags, name FROM tree, inodes WHERE tree.inode = inodes.inode AND tree.inode = ?1",
+                                                                      params![ino], |row| {Ok((row.get::<_, u64>(0).unwrap(), row.get::<_, String>(1).unwrap()))});
+        let mut flags;
+        let mut file_name;
+        match query_result {
+            Ok((f, n)) => {
+                flags = f;
+                file_name = n;
             }
-            Err(_) => Err(Error::NoEntry),
+            Err(_) => return Err(Error::NoEntry),
         }
+
+        if flags == 1 {
+            let mut stmt = self
+                .conn
+                .prepare(&*format!("SELECT * FROM {}", file_name))
+                .unwrap();
+            let mut table_content = stmt.query([]).unwrap();
+            let result_str = MemFilesystem::rows_to_csv(&mut table_content);
+            println!("{}", result_str);
+            Ok(Vec::from(result_str.as_bytes()))
+        } else {
+            match self
+                .conn
+                .blob_open(DatabaseName::Main, "inodes", "data", ino as i64, false)
+            {
+                Ok(blob) => {
+                    let mut buf = vec![b'0'; size as usize];
+                    blob.read_at(buf.as_mut(), offset as usize);
+                    Ok(buf)
+                }
+                Err(_) => Err(Error::NoEntry),
+            }
+        }
+    }
+
+    fn rows_to_csv(table_content: &mut Rows) -> String {
+        let mut result: Vec<String> = Vec::new();
+        while let Some(row) = table_content.next().unwrap() {
+            let mut row_str: Vec<String> = Vec::new();
+            for i in 1..row.column_count() {
+                let value = match row.get_ref_unwrap(i) {
+                    ValueRef::Null => String::new(),
+                    ValueRef::Integer(v) => v.to_string(),
+                    ValueRef::Real(v) => v.to_string(),
+                    ValueRef::Text(v) => String::from_utf8_lossy(v).into_owned(),
+                    ValueRef::Blob(v) => String::from_utf8_lossy(v).into_owned(),
+                };
+                row_str.push(value);
+            }
+            result.push(row_str.join(","))
+        }
+        let result_str = result.join("\n");
+        result_str
     }
 
     /// Rename a file.
@@ -1418,7 +1344,6 @@ mod test {
         let test_file_name_1 = "testFile";
         let test_file_name_2 = "testFile2";
         let test_file_name_3 = "testFile3";
-        let test_dir_name = "testDir";
 
         fs::remove_file(test_DB_path);
         let mut f = MemFilesystem::new_path(test_DB_path);
@@ -1446,5 +1371,124 @@ mod test {
 
         let xattr = f.listxattr(2).unwrap();
         assert_eq!(xattr.as_slice(), "requires".as_bytes())
+    }
+
+    #[test]
+    fn memfs_structured_files() {
+        let test_DB_path = "/tmp/test7.db";
+        let db_file = "db.sql";
+        let db_ = "testFile2";
+
+        fs::remove_file(test_DB_path);
+        let mut f = MemFilesystem::new_path(test_DB_path);
+
+        f.create(1, OsStr::new(db_file), 0, 0);
+
+        let sql ="\
+        BEGIN; \
+            CREATE TABLE contacts (\
+                contact_id INTEGER PRIMARY KEY,\
+                first_name TEXT NOT NULL,\
+                last_name TEXT NOT NULL,\
+                email TEXT NOT NULL UNIQUE,\
+                phone TEXT NOT NULL UNIQUE\
+                ); \
+            INSERT INTO contacts (first_name, last_name, email, phone) VALUES ('first', 'last', 'mail', 'number' ), ('first2', 'last2', 'mail2', 'number2' ); \
+        COMMIT;";
+
+        let err = f.write(2, 0, 0, sql.as_bytes(), 0);
+        assert_eq!(err.is_err(), false);
+        let csv = f.read(3, 0, 0, 100);
+        assert_eq!(err.is_err(), false);
+        let l = f.getattr(3);
+        assert!(l.unwrap().size > 20);
+    }
+
+    #[test]
+    fn memfs_unlink() {
+        let test_DB_path = "/tmp/test8.db";
+        let test_file_name = "testFile";
+
+        fs::remove_file(test_DB_path);
+        let mut f = MemFilesystem::new_path(test_DB_path);
+
+        let r = f.unlink(1, test_file_name.as_ref());
+        assert_eq!(r.unwrap_err(), Error::NoEntry);
+
+        f.create(1, OsStr::new(test_file_name), 0, 0);
+
+        let r = f.readdir(1 ,0);
+        assert!(r.is_ok());
+        let dir_entries = r.unwrap();
+        assert_eq!(dir_entries.len(), 3);
+        assert_eq!(dir_entries[2].2, test_file_name);
+
+
+        let r = f.unlink(1, test_file_name.as_ref());
+        assert!(r.is_ok());
+
+        let r = f.readdir(1 ,0);
+        assert!(r.is_ok());
+        assert_eq!(r.unwrap().len(), 2);
+    }
+
+    #[test]
+    fn memfs_rmdir() {
+        let test_DB_path = "/tmp/test9.db";
+        let test_file_name = "testFile";
+        let test_dir_name = "testDir";
+
+        fs::remove_file(test_DB_path);
+        let mut f = MemFilesystem::new_path(test_DB_path);
+
+        let r = f.rmdir(1, test_dir_name.as_ref());
+        assert_eq!(r.unwrap_err(), Error::NoEntry);
+
+        f.mkdir(1, OsStr::new(test_dir_name), 0);
+
+        let r = f.readdir(1 ,0);
+        assert!(r.is_ok());
+        let dir_entries = r.unwrap();
+        assert_eq!(dir_entries.len(), 3);
+        assert_eq!(dir_entries[2].2, test_dir_name);
+
+        let r = f.rmdir(1, test_dir_name.as_ref());
+        assert!(r.is_ok());
+
+        let r = f.readdir(1 ,0);
+        assert!(r.is_ok());
+        assert_eq!(r.unwrap().len(), 2);
+
+        f.mkdir(1, OsStr::new(test_dir_name), 0);
+
+        let r = f.readdir(1 ,0);
+        assert!(r.is_ok());
+        let dir_entries = r.unwrap();
+        assert_eq!(dir_entries.len(), 3);
+        assert_eq!(dir_entries[2].2, test_dir_name);
+
+        f.create(2, test_file_name.as_ref(), 0,0);
+
+        let r = f.readdir(1 ,0);
+        assert!(r.is_ok());
+        let dir_entries = r.unwrap();
+        assert_eq!(dir_entries.len(), 3);
+        assert_eq!(dir_entries[2].2, test_dir_name);
+
+        let r = f.readdir(2 ,0);
+        assert!(r.is_ok());
+        let dir_entries = r.unwrap();
+        assert_eq!(dir_entries.len(), 3);
+        assert_eq!(dir_entries[2].2, test_file_name);
+
+        let r = f.rmdir(1, test_dir_name.as_ref());
+        assert!(r.is_err());
+        assert_eq!(r.unwrap_err(), Error::NotEmpty);
+
+        let r = f.readdir(1 ,0);
+        assert!(r.is_ok());
+        let dir_entries = r.unwrap();
+        assert_eq!(dir_entries.len(), 3);
+        assert_eq!(dir_entries[2].2, test_dir_name);
     }
 }

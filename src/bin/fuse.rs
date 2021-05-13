@@ -4,7 +4,6 @@ use log::error;
 fn main() {
     env_logger::init();
 
-    let fs = MemFilesystem::new();
     let mountpoint = match std::env::args().nth(1) {
         Some(path) => path,
         None => {
@@ -15,5 +14,6 @@ fn main() {
             return;
         }
     };
+    let fs = MemFilesystem::new();
     fuse::mount(fs, &mountpoint, &[]).unwrap();
 }
