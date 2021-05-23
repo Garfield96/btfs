@@ -25,7 +25,7 @@ use libc::{c_int, EEXIST, EINVAL, ENOENT, ENOTEMPTY};
 use log::{debug, error, info, trace};
 use regex::Regex;
 use rusqlite::types::ValueRef;
-use rusqlite::{params, Connection, DatabaseName, Result, Rows};
+use rusqlite::{params, Connection, DatabaseName, Result, Row, Rows};
 use time::Timespec;
 
 const TTL: Timespec = Timespec { sec: 1, nsec: 0 };
@@ -274,11 +274,28 @@ impl MemFilesystem {
         let name = name.to_str().unwrap();
         debug!("getxattr(ino={}, name={})", ino, name);
 
-        if name.starts_with("sql#") {
+        if name.starts_with("dependents") {
             let mut stmt = self
                 .conn
-                .prepare(name.strip_prefix("sql#").unwrap())
+                .prepare(
+                    "SELECT name FROM dependencies, tree \
+                WHERE dependencies.inode = tree.inode AND dep_inode = ?1",
+                )
                 .unwrap();
+            let mut table_content = stmt
+                .query_map(params![ino], |row| row.get::<_, String>(0))
+                .unwrap();
+            let result: Vec<String> = table_content.map(|e| e.unwrap()).collect();
+            return Ok(result.join(","));
+        }
+
+        if name.starts_with("sql#") {
+            let mut stmt = self.conn.prepare(name.strip_prefix("sql#").unwrap());
+            if (stmt.is_err()) {
+                debug!("{}", stmt.unwrap_err().to_string());
+                return Err(Error::InvalidInput);
+            }
+            let mut stmt = stmt.unwrap();
             let mut table_content = stmt.query([]).unwrap();
             return Ok(MemFilesystem::rows_to_csv(&mut table_content));
         }
@@ -425,15 +442,14 @@ impl MemFilesystem {
         let value = from_utf8(value).unwrap();
         debug!("setxattr(ino={}, name={}, value={})", ino, name, value);
 
-        // let meta = fs::metadata(value).unwrap();
-
         let changed_rows = self
             .conn
             .execute(
                 "\
          INSERT INTO dependencies (inode, dep_inode, type)  \
-         SELECT ?1, ?2, ?3 WHERE EXISTS (SELECT * FROM inodes WHERE inode = ?1)",
-                params![ino, value.parse::<u64>().unwrap(), name],
+         SELECT ?1, tree.inode, ?3 FROM tree \
+         WHERE EXISTS (SELECT * FROM inodes WHERE inode = ?1) AND tree.name = ?2",
+                params![ino, value, name],
             )
             .unwrap();
 
@@ -531,12 +547,10 @@ impl MemFilesystem {
             match number_of_children {
                 Ok(n) => {
                     if n > 0 {
-                        return Err(Error::NotEmpty)
+                        return Err(Error::NotEmpty);
                     }
-                },
-                Err(_) => {
-                    return Err(Error::NoEntry)
                 }
+                Err(_) => return Err(Error::NoEntry),
             }
             let changed_rows = tx.execute("\
         UPDATE inodes SET nlink = nlink - 1 WHERE inode = (SELECT inode FROM tree WHERE parent = ?1 AND name = ?2);",
@@ -580,10 +594,12 @@ impl MemFilesystem {
                 tx.rollback();
                 return Err(Error::NoEntry);
             }
-            tx.execute("\
+            tx.execute(
+                "\
         DELETE FROM tree WHERE parent = ?1 AND name = ?2;",
                 params![parent, name_str],
-            ).unwrap();
+            )
+            .unwrap();
             tx.execute("DELETE FROM inodes WHERE nlink = 0", [])
                 .unwrap();
         }
@@ -835,19 +851,30 @@ impl MemFilesystem {
 
     fn rows_to_csv(table_content: &mut Rows) -> String {
         let mut result: Vec<String> = Vec::new();
-        while let Some(row) = table_content.next().unwrap() {
-            let mut row_str: Vec<String> = Vec::new();
-            for i in 1..row.column_count() {
-                let value = match row.get_ref_unwrap(i) {
-                    ValueRef::Null => String::new(),
-                    ValueRef::Integer(v) => v.to_string(),
-                    ValueRef::Real(v) => v.to_string(),
-                    ValueRef::Text(v) => String::from_utf8_lossy(v).into_owned(),
-                    ValueRef::Blob(v) => String::from_utf8_lossy(v).into_owned(),
-                };
-                row_str.push(value);
+        while let row = table_content.next() {
+            if row.is_err() {
+                break;
             }
-            result.push(row_str.join(","))
+            let row_result = row.unwrap();
+            match row_result {
+                None => {
+                    break;
+                }
+                Some(row) => {
+                    let mut row_str: Vec<String> = Vec::new();
+                    for i in 1..row.column_count() {
+                        let value = match row.get_ref_unwrap(i) {
+                            ValueRef::Null => String::new(),
+                            ValueRef::Integer(v) => v.to_string(),
+                            ValueRef::Real(v) => v.to_string(),
+                            ValueRef::Text(v) => String::from_utf8_lossy(v).into_owned(),
+                            ValueRef::Blob(v) => String::from_utf8_lossy(v).into_owned(),
+                        };
+                        row_str.push(value);
+                    }
+                    result.push(row_str.join(","))
+                }
+            }
         }
         let result_str = result.join("\n");
         result_str
@@ -1417,17 +1444,16 @@ mod test {
 
         f.create(1, OsStr::new(test_file_name), 0, 0);
 
-        let r = f.readdir(1 ,0);
+        let r = f.readdir(1, 0);
         assert!(r.is_ok());
         let dir_entries = r.unwrap();
         assert_eq!(dir_entries.len(), 3);
         assert_eq!(dir_entries[2].2, test_file_name);
 
-
         let r = f.unlink(1, test_file_name.as_ref());
         assert!(r.is_ok());
 
-        let r = f.readdir(1 ,0);
+        let r = f.readdir(1, 0);
         assert!(r.is_ok());
         assert_eq!(r.unwrap().len(), 2);
     }
@@ -1446,7 +1472,7 @@ mod test {
 
         f.mkdir(1, OsStr::new(test_dir_name), 0);
 
-        let r = f.readdir(1 ,0);
+        let r = f.readdir(1, 0);
         assert!(r.is_ok());
         let dir_entries = r.unwrap();
         assert_eq!(dir_entries.len(), 3);
@@ -1455,27 +1481,27 @@ mod test {
         let r = f.rmdir(1, test_dir_name.as_ref());
         assert!(r.is_ok());
 
-        let r = f.readdir(1 ,0);
+        let r = f.readdir(1, 0);
         assert!(r.is_ok());
         assert_eq!(r.unwrap().len(), 2);
 
         f.mkdir(1, OsStr::new(test_dir_name), 0);
 
-        let r = f.readdir(1 ,0);
+        let r = f.readdir(1, 0);
         assert!(r.is_ok());
         let dir_entries = r.unwrap();
         assert_eq!(dir_entries.len(), 3);
         assert_eq!(dir_entries[2].2, test_dir_name);
 
-        f.create(2, test_file_name.as_ref(), 0,0);
+        f.create(2, test_file_name.as_ref(), 0, 0);
 
-        let r = f.readdir(1 ,0);
+        let r = f.readdir(1, 0);
         assert!(r.is_ok());
         let dir_entries = r.unwrap();
         assert_eq!(dir_entries.len(), 3);
         assert_eq!(dir_entries[2].2, test_dir_name);
 
-        let r = f.readdir(2 ,0);
+        let r = f.readdir(2, 0);
         assert!(r.is_ok());
         let dir_entries = r.unwrap();
         assert_eq!(dir_entries.len(), 3);
@@ -1485,7 +1511,7 @@ mod test {
         assert!(r.is_err());
         assert_eq!(r.unwrap_err(), Error::NotEmpty);
 
-        let r = f.readdir(1 ,0);
+        let r = f.readdir(1, 0);
         assert!(r.is_ok());
         let dir_entries = r.unwrap();
         assert_eq!(dir_entries.len(), 3);
