@@ -10,25 +10,23 @@ use std::ffi::OsStr;
 use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 use std::str::from_utf8;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{fs, process};
 
-use fuse::{
+use fuser::{
     Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
-    ReplyOpen, ReplyWrite, ReplyXattr, Request,
+    ReplyOpen, ReplyWrite, ReplyXattr, Request, TimeOrNow,
 };
 // Re-export reused structs from fuse:
-pub use fuse::FileAttr;
-pub use fuse::FileType;
+pub use fuser::FileAttr;
+pub use fuser::FileType;
 
 use libc::{c_int, EEXIST, EINVAL, ENOENT, ENOTEMPTY};
 use log::{debug, error, info, trace};
 use regex::Regex;
 use rusqlite::types::ValueRef;
-use rusqlite::{params, Connection, DatabaseName, Result, Row, Rows};
-use time::Timespec;
-
-const TTL: Timespec = Timespec { sec: 1, nsec: 0 };
+use rusqlite::{params, Connection, DatabaseName, Result, Rows};
+use std::ops::Add;
 
 pub type InodeId = u64;
 
@@ -88,12 +86,13 @@ pub struct SetAttrRequest {
     pub uid: Option<u32>,
     pub gid: Option<u32>,
     pub size: Option<u64>,
-    pub atime: Option<Timespec>,
-    pub mtime: Option<Timespec>,
+    pub atime: Option<TimeOrNow>,
+    pub mtime: Option<TimeOrNow>,
+    pub ctime: Option<SystemTime>,
     pub fh: Option<u64>,
-    pub crtime: Option<Timespec>,
-    pub chgtime: Option<Timespec>,
-    pub bkuptime: Option<Timespec>,
+    pub crtime: Option<SystemTime>,
+    pub chgtime: Option<SystemTime>,
+    pub bkuptime: Option<SystemTime>,
     pub flags: Option<u32>,
 }
 
@@ -119,6 +118,24 @@ pub struct MemFilesystem {
     inodes: BTreeMap<u64, Inode>,
     next_inode: u64,
     conn: Connection,
+    TTL: Duration,
+}
+
+fn toSystemtime(sec: u64) -> SystemTime {
+    let d = Duration::new(sec, 0);
+    UNIX_EPOCH.add(d)
+}
+
+fn timeOrNowToUnixTime(t: TimeOrNow) -> u64 {
+    match t {
+        TimeOrNow::SpecificTime(specificTime) => {
+            specificTime.duration_since(UNIX_EPOCH).unwrap().as_secs()
+        }
+        TimeOrNow::Now => SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    }
 }
 
 impl MemFilesystem {
@@ -182,7 +199,7 @@ impl MemFilesystem {
 
         let mut attrs = BTreeMap::new();
         let mut inodes = BTreeMap::new();
-        let ts = time::now().to_timespec();
+        let ts = SystemTime::now();
         let attr = FileAttr {
             ino: 1,
             size: 0,
@@ -197,6 +214,8 @@ impl MemFilesystem {
             uid: 0,
             gid: 0,
             rdev: 0,
+            blksize: 0,
+            padding: 0,
             flags: 0,
         };
         attrs.insert(1, attr);
@@ -212,6 +231,7 @@ impl MemFilesystem {
             inodes: inodes,
             next_inode: 2,
             conn: conn,
+            TTL: Duration::new(1, 0),
         }
     }
 
@@ -233,28 +253,18 @@ impl MemFilesystem {
                 ino: row.get(0)?,
                 size: row.get(1)?,
                 blocks: row.get(2)?,
-                atime: Timespec {
-                    sec: row.get(3)?,
-                    nsec: 0,
-                },
-                mtime: Timespec {
-                    sec: row.get(4)?,
-                    nsec: 0,
-                },
-                ctime: Timespec {
-                    sec: row.get(5)?,
-                    nsec: 0,
-                },
-                crtime: Timespec {
-                    sec: row.get(6)?,
-                    nsec: 0,
-                },
+                atime: toSystemtime(row.get::<_, u64>(3).unwrap()),
+                mtime: toSystemtime(row.get::<_, u64>(4).unwrap()),
+                ctime: toSystemtime(row.get::<_, u64>(5).unwrap()),
+                crtime: toSystemtime(row.get::<_, u64>(6).unwrap()),
                 kind: IntToFileType(row.get(7)?),
                 perm: row.get(8)?,
                 nlink: row.get(9)?,
                 uid: row.get(10)?,
                 gid: row.get(11)?,
                 rdev: row.get(12)?,
+                blksize: 0,
+                padding: 0,
                 flags: row.get(13)?,
             })
         }) {
@@ -282,7 +292,7 @@ impl MemFilesystem {
                 WHERE dependencies.inode = tree.inode AND dep_inode = ?1",
                 )
                 .unwrap();
-            let mut table_content = stmt
+            let table_content = stmt
                 .query_map(params![ino], |row| row.get::<_, String>(0))
                 .unwrap();
             let result: Vec<String> = table_content.map(|e| e.unwrap()).collect();
@@ -290,8 +300,8 @@ impl MemFilesystem {
         }
 
         if name.starts_with("sql#") {
-            let mut stmt = self.conn.prepare(name.strip_prefix("sql#").unwrap());
-            if (stmt.is_err()) {
+            let stmt = self.conn.prepare(name.strip_prefix("sql#").unwrap());
+            if stmt.is_err() {
                 debug!("{}", stmt.unwrap_err().to_string());
                 return Err(Error::InvalidInput);
             }
@@ -403,17 +413,31 @@ impl MemFilesystem {
                 String::new()
             }),
             (if new_attrs.atime.is_some() {
-                format!("atime = {}", new_attrs.atime.unwrap_or(TTL).sec)
+                format!(
+                    "atime = {}",
+                    timeOrNowToUnixTime(new_attrs.atime.unwrap_or(TimeOrNow::Now))
+                )
             } else {
                 String::new()
             }),
             (if new_attrs.mtime.is_some() {
-                format!("mtime = {}", new_attrs.mtime.unwrap_or(TTL).sec)
+                format!(
+                    "mtime = {}",
+                    timeOrNowToUnixTime(new_attrs.mtime.unwrap_or(TimeOrNow::Now))
+                )
             } else {
                 String::new()
             }),
             (if new_attrs.crtime.is_some() {
-                format!("crtime = {}", new_attrs.crtime.unwrap_or(TTL).sec)
+                format!(
+                    "crtime = {}",
+                    new_attrs
+                        .crtime
+                        .unwrap_or(SystemTime::now())
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs()
+                )
             } else {
                 String::new()
             }),
@@ -506,28 +530,18 @@ impl MemFilesystem {
                 ino: row.get(0)?,
                 size: row.get(1)?,
                 blocks: row.get(2)?,
-                atime: Timespec {
-                    sec: row.get(3)?,
-                    nsec: 0,
-                },
-                mtime: Timespec {
-                    sec: row.get(4)?,
-                    nsec: 0,
-                },
-                ctime: Timespec {
-                    sec: row.get(5)?,
-                    nsec: 0,
-                },
-                crtime: Timespec {
-                    sec: row.get(6)?,
-                    nsec: 0,
-                },
+                atime: toSystemtime(row.get(3).unwrap()),
+                mtime: toSystemtime(row.get(4).unwrap()),
+                ctime: toSystemtime(row.get(5).unwrap()),
+                crtime: toSystemtime(row.get(6).unwrap()),
                 kind: IntToFileType(row.get(7)?),
                 perm: row.get(8)?,
                 nlink: row.get(9)?,
                 uid: row.get(10)?,
                 gid: row.get(11)?,
                 rdev: row.get(12)?,
+                blksize: 0,
+                padding: 0,
                 flags: row.get(13)?,
             })
         }) {
@@ -612,7 +626,7 @@ impl MemFilesystem {
         parent: u64,
         name: &OsStr,
         mode: u32,
-        flags: u32,
+        flags: i32,
     ) -> Result<FileAttr, Error> {
         let name_str = name.to_str().unwrap();
         debug!(
@@ -626,7 +640,7 @@ impl MemFilesystem {
     fn create_entry(
         &mut self,
         parent: u64,
-        flags: u32,
+        flags: i32,
         name_str: &str,
         mode: u32,
         file_type: FileType,
@@ -678,10 +692,7 @@ impl MemFilesystem {
             return Err(Error::AlreadyExists);
         }
         tx.commit();
-        let ts_now = Timespec {
-            sec: now as i64,
-            nsec: 0,
-        };
+        let ts_now = SystemTime::now();
         Ok(FileAttr {
             ino: new_inode_nr,
             size: 0,
@@ -696,7 +707,9 @@ impl MemFilesystem {
             uid: 0,
             gid: 0,
             rdev: 0,
-            flags,
+            blksize: 0,
+            padding: 0,
+            flags: flags as u32,
         })
     }
 
@@ -706,7 +719,7 @@ impl MemFilesystem {
         fh: u64,
         offset: i64,
         data: &[u8],
-        _flags: u32,
+        _flags: i32,
     ) -> Result<u64, Error> {
         debug!("write(ino={}, fh={}, offset={})", ino, fh, offset);
 
@@ -851,7 +864,8 @@ impl MemFilesystem {
 
     fn rows_to_csv(table_content: &mut Rows) -> String {
         let mut result: Vec<String> = Vec::new();
-        while let row = table_content.next() {
+        loop {
+            let row = table_content.next();
             if row.is_err() {
                 break;
             }
@@ -902,6 +916,32 @@ impl MemFilesystem {
 
         Ok(())
     }
+
+    pub fn fallocate(&mut self, ino: u64, offset: i64, length: i64) -> Result<(), Error> {
+        let mut tx = self.conn.transaction().unwrap();
+        {
+            let mut blob = tx.blob_open(DatabaseName::Main, "inodes", "data", ino as i64, false);
+            if blob.is_err() {
+                return Err(Error::NoEntry);
+            }
+
+            let mut blob = blob.unwrap();
+
+            if blob.size() > (offset + length) as i32 {
+                // truncate
+            } else {
+                let mut buf = vec![0; (offset + length) as usize];
+                blob.read_exact(buf.as_mut());
+                tx.execute("UPDATE inodes SET data = zeroblob(?2), size = ?2, atime = ?3, mtime = ?3 WHERE inode = ?1",
+                           params![ino, offset + length, SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()]);
+                blob.reopen(ino as i64);
+                // let mut blob = self.conn.blob_open(DatabaseName::Main, "inodes", "data", ino as i64, false).unwrap();
+                blob.write_all_at(buf.as_slice(), 0).unwrap();
+            }
+        }
+        tx.commit().expect("fallocate: Commit failed");
+        Ok(())
+    }
 }
 
 impl Default for MemFilesystem {
@@ -915,7 +955,7 @@ impl Filesystem for MemFilesystem {
         match self.getattr(ino) {
             Ok(attr) => {
                 info!("getattr reply with attrs = {:?}", attr);
-                reply.attr(&TTL, &attr)
+                reply.attr(&self.TTL, &attr)
             }
             Err(e) => {
                 error!("getattr reply with errno = {:?}", e);
@@ -972,12 +1012,13 @@ impl Filesystem for MemFilesystem {
         uid: Option<u32>,
         gid: Option<u32>,
         size: Option<u64>,
-        atime: Option<Timespec>,
-        mtime: Option<Timespec>,
+        atime: Option<TimeOrNow>,
+        mtime: Option<TimeOrNow>,
+        ctime: Option<SystemTime>,
         fh: Option<u64>,
-        crtime: Option<Timespec>,
-        chgtime: Option<Timespec>,
-        bkuptime: Option<Timespec>,
+        crtime: Option<SystemTime>,
+        chgtime: Option<SystemTime>,
+        bkuptime: Option<SystemTime>,
         flags: Option<u32>,
         reply: ReplyAttr,
     ) {
@@ -988,6 +1029,7 @@ impl Filesystem for MemFilesystem {
             size,
             atime,
             mtime,
+            ctime,
             fh,
             crtime,
             chgtime,
@@ -998,7 +1040,7 @@ impl Filesystem for MemFilesystem {
         let r = self.setattr(ino, new_attrs);
         match r {
             Ok(fattrs) => {
-                reply.attr(&TTL, &fattrs);
+                reply.attr(&self.TTL, &fattrs);
             }
             Err(e) => reply.error(e.into()),
         };
@@ -1010,7 +1052,7 @@ impl Filesystem for MemFilesystem {
         _ino: u64,
         _name: &OsStr,
         _value: &[u8],
-        _flags: u32,
+        _flags: i32,
         _position: u32,
         reply: ReplyEmpty,
     ) {
@@ -1048,7 +1090,9 @@ impl Filesystem for MemFilesystem {
                 // and we should start after it.
                 let to_skip = if offset == 0 { 0 } else { offset + 1 } as usize;
                 for (i, entry) in entries.into_iter().enumerate().skip(to_skip) {
-                    reply.add(entry.0, i as i64, entry.1, entry.2);
+                    if reply.add(entry.0, i as i64, entry.1, entry.2) {
+                        break;
+                    }
                 }
                 reply.ok();
             }
@@ -1059,7 +1103,7 @@ impl Filesystem for MemFilesystem {
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
         match self.lookup(parent, name) {
             Ok(attr) => {
-                reply.entry(&TTL, &attr, 0);
+                reply.entry(&self.TTL, &attr, 0);
             }
             Err(e) => {
                 reply.error(e.into());
@@ -1074,16 +1118,24 @@ impl Filesystem for MemFilesystem {
         }
     }
 
-    fn mkdir(&mut self, _req: &Request, parent: u64, name: &OsStr, mode: u32, reply: ReplyEntry) {
+    fn mkdir(
+        &mut self,
+        _req: &Request,
+        parent: u64,
+        name: &OsStr,
+        mode: u32,
+        _umask: u32,
+        reply: ReplyEntry,
+    ) {
         match self.mkdir(parent, name, mode) {
-            Ok(attr) => reply.entry(&TTL, &attr, 0),
+            Ok(attr) => reply.entry(&self.TTL, &attr, 0),
             Err(e) => reply.error(e.into()),
         }
     }
 
-    fn open(&mut self, _req: &Request, _ino: u64, flags: u32, reply: ReplyOpen) {
+    fn open(&mut self, _req: &Request, _ino: u64, flags: i32, reply: ReplyOpen) {
         trace!("open(ino={}, _flags={})", _ino, flags);
-        reply.opened(0, flags);
+        reply.opened(0, flags as u32);
     }
 
     fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
@@ -1099,11 +1151,12 @@ impl Filesystem for MemFilesystem {
         parent: u64,
         name: &OsStr,
         mode: u32,
-        flags: u32,
+        _umask: u32,
+        flags: i32,
         reply: ReplyCreate,
     ) {
         match self.create(parent, name, mode, flags) {
-            Ok(attr) => reply.created(&TTL, &attr, 0, 0, 0),
+            Ok(attr) => reply.created(&self.TTL, &attr, 0, 0, 0),
             Err(e) => reply.error(e.into()),
         }
     }
@@ -1115,7 +1168,9 @@ impl Filesystem for MemFilesystem {
         fh: u64,
         offset: i64,
         data: &[u8],
-        flags: u32,
+        _write_flags: u32,
+        flags: i32,
+        _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
         match self.write(ino, fh, offset, data, flags) {
@@ -1131,6 +1186,8 @@ impl Filesystem for MemFilesystem {
         fh: u64,
         offset: i64,
         size: u32,
+        _flags: i32,
+        _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
         match self.read(ino, fh, offset, size) {
@@ -1146,9 +1203,26 @@ impl Filesystem for MemFilesystem {
         name: &OsStr,
         newparent: u64,
         newname: &OsStr,
+        _flags: u32,
         reply: ReplyEmpty,
     ) {
         match self.rename(parent, name, newparent, newname) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(e.into()),
+        }
+    }
+
+    fn fallocate(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        _fh: u64,
+        offset: i64,
+        length: i64,
+        _mode: i32,
+        reply: ReplyEmpty,
+    ) {
+        match self.fallocate(ino, offset, length) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e.into()),
         }
@@ -1161,16 +1235,21 @@ mod test {
 
     #[test]
     fn memfs_create_readdir() {
-        let test_DB_path = "/tmp/test1.db";
+        let test_db_path = "/tmp/test1.db";
         let test_file_name = "testFile";
 
-        fs::remove_file(test_DB_path);
-        let mut f = MemFilesystem::new_path(test_DB_path);
+        match fs::remove_file(test_db_path) {
+            Err(ref e) if e.kind() != std::io::ErrorKind::NotFound => {
+                assert!(false, "{}", e.to_string())
+            }
+            _ => {}
+        }
+        let mut f = MemFilesystem::new_path(test_db_path);
         // check non existing parent
         let err = f.create(3, OsStr::new(test_file_name), 0, 0);
         assert_eq!(err.unwrap_err(), Error::ParentNotFound);
 
-        f.create(1, OsStr::new(test_file_name), 0, 0);
+        assert!(f.create(1, OsStr::new(test_file_name), 0, 0).is_ok());
         let dir_content = f.readdir(1, 0).unwrap();
         let (ino, ft, name) = dir_content.get(0).unwrap();
         assert_eq!(*ino, 1);
@@ -1193,12 +1272,17 @@ mod test {
 
     #[test]
     fn memfs_mkdir_readdir() {
-        let test_DB_path = "/tmp/test2.db";
+        let test_db_path = "/tmp/test2.db";
         let test_file_name = "testDir";
 
-        fs::remove_file(test_DB_path);
-        let mut f = MemFilesystem::new_path(test_DB_path);
-        f.mkdir(1, OsStr::new(test_file_name), 0);
+        match fs::remove_file(test_db_path) {
+            Err(ref e) if e.kind() != std::io::ErrorKind::NotFound => {
+                assert!(false, "{}", e.to_string())
+            }
+            _ => {}
+        }
+        let mut f = MemFilesystem::new_path(test_db_path);
+        assert!(f.mkdir(1, OsStr::new(test_file_name), 0).is_ok());
         let dir_content = f.readdir(1, 0).unwrap();
         let (ino, ft, name) = dir_content.get(0).unwrap();
         assert_eq!(*ino, 1);
@@ -1218,11 +1302,16 @@ mod test {
 
     #[test]
     fn memfs_read_write() {
-        let test_DB_path = "/tmp/test3.db";
+        let test_db_path = "/tmp/test3.db";
         let test_file_name = "testFile";
 
-        fs::remove_file(test_DB_path);
-        let mut f = MemFilesystem::new_path(test_DB_path);
+        match fs::remove_file(test_db_path) {
+            Err(ref e) if e.kind() != std::io::ErrorKind::NotFound => {
+                assert!(false, "{}", e.to_string())
+            }
+            _ => {}
+        }
+        let mut f = MemFilesystem::new_path(test_db_path);
 
         // check non existing file
         let err = f.read(2, 0, 0, 10);
@@ -1232,15 +1321,15 @@ mod test {
         let err = f.write(2, 0, 0, data.as_bytes(), 0);
         assert_eq!(err.unwrap_err(), Error::NoEntry);
 
-        f.create(1, OsStr::new(test_file_name), 0, 0);
+        assert!(f.create(1, OsStr::new(test_file_name), 0, 0).is_ok());
 
-        f.write(2, 0, 0, data.as_bytes(), 0);
+        assert!(f.write(2, 0, 0, data.as_bytes(), 0).is_ok());
         let safed_content = f.read(2, 0, 0, data.len() as u32).unwrap();
         assert_eq!(safed_content.len(), data.len());
         assert_eq!(safed_content.as_slice(), data.as_bytes());
 
         // Append
-        f.write(2, 0, data.len() as i64, data.as_bytes(), 0);
+        assert!(f.write(2, 0, data.len() as i64, data.as_bytes(), 0).is_ok());
         let data = "ContentContent";
         let safed_content = f.read(2, 0, 0, data.len() as u32).unwrap();
         assert_eq!(safed_content.len(), data.len());
@@ -1248,7 +1337,7 @@ mod test {
 
         // Modify
         let modification = "abc";
-        f.write(2, 0, 3, modification.as_bytes(), 0);
+        assert!(f.write(2, 0, 3, modification.as_bytes(), 0).is_ok());
         let data = "ConabctContent";
         let safed_content = f.read(2, 0, 0, data.len() as u32).unwrap();
         assert_eq!(safed_content.len(), data.len());
@@ -1256,8 +1345,8 @@ mod test {
 
         // Big data
         let data = String::from_utf8(vec![b'1'; 1000000]).unwrap();
-        f.write(2, 0, 0, data.as_bytes(), 0);
-        f.write(2, 0, 1000000, data.as_bytes(), 0);
+        assert!(f.write(2, 0, 0, data.as_bytes(), 0).is_ok());
+        assert!(f.write(2, 0, 1000000, data.as_bytes(), 0).is_ok());
         let safed_content = f.read(2, 0, 0, 2 * data.len() as u32).unwrap();
         assert_eq!(safed_content.len(), 2 * data.len());
         assert_eq!(
@@ -1272,6 +1361,7 @@ mod test {
             size: Option::Some(100),
             atime: Option::None,
             mtime: Option::None,
+            ctime: Option::None,
             fh: Option::None,
             crtime: Option::None,
             chgtime: Option::None,
@@ -1288,19 +1378,24 @@ mod test {
 
     #[test]
     fn memfs_lookup() {
-        let test_DB_path = "/tmp/test4.db";
+        let test_db_path = "/tmp/test4.db";
         let test_file_name = "testFile";
         let test_dir_name = "testDir";
 
-        fs::remove_file(test_DB_path);
-        let mut f = MemFilesystem::new_path(test_DB_path);
+        match fs::remove_file(test_db_path) {
+            Err(ref e) if e.kind() != std::io::ErrorKind::NotFound => {
+                assert!(false, "{}", e.to_string())
+            }
+            _ => {}
+        }
+        let mut f = MemFilesystem::new_path(test_db_path);
 
         // check non existing file
         let file_attr = f.lookup(1, OsStr::new(test_file_name));
         assert_eq!(file_attr.unwrap_err(), Error::NoEntry);
 
-        f.create(1, OsStr::new(test_file_name), 0, 0);
-        f.mkdir(1, OsStr::new(test_dir_name), 0);
+        assert!(f.create(1, OsStr::new(test_file_name), 0, 0).is_ok());
+        assert!(f.mkdir(1, OsStr::new(test_dir_name), 0).is_ok());
 
         let file_attr = f.lookup(1, OsStr::new(test_file_name)).unwrap();
         assert_eq!(file_attr.size, 0);
@@ -1310,36 +1405,43 @@ mod test {
         assert_eq!(dir_attr.kind, FileType::Directory);
 
         let data = "Content";
-        f.write(2, 0, 0, data.as_bytes(), 0);
+        assert!(f.write(2, 0, 0, data.as_bytes(), 0).is_ok());
         let file_attr = f.lookup(1, OsStr::new(test_file_name)).unwrap();
         assert_eq!(file_attr.size, data.len() as u64);
     }
 
     #[test]
     fn memfs_set_get_attr() {
-        let test_DB_path = "/tmp/test5.db";
+        let test_db_path = "/tmp/test5.db";
         let test_file_name = "testFile";
 
-        fs::remove_file(test_DB_path);
-        let mut f = MemFilesystem::new_path(test_DB_path);
+        match fs::remove_file(test_db_path) {
+            Err(ref e) if e.kind() != std::io::ErrorKind::NotFound => {
+                assert!(false, "{}", e.to_string())
+            }
+            _ => {}
+        }
+        let mut f = MemFilesystem::new_path(test_db_path);
         let new_attrs = SetAttrRequest {
             mode: Option::Some(1),
             uid: Option::Some(2),
             gid: Option::Some(3),
             size: Option::Some(4),
-            atime: Option::Some(TTL),
-            mtime: Option::Some(TTL),
+            atime: Option::Some(TimeOrNow::Now),
+            mtime: Option::Some(TimeOrNow::Now),
+            ctime: Option::Some(SystemTime::now()),
             fh: Option::Some(7),
-            crtime: Option::Some(TTL),
-            chgtime: Option::Some(TTL),
-            bkuptime: Option::Some(TTL),
+            crtime: Option::Some(SystemTime::now()),
+            chgtime: Option::Some(SystemTime::now()),
+            bkuptime: Option::Some(SystemTime::now()),
             flags: Option::Some(11),
         };
         let err = f.setattr(2, new_attrs);
         assert_eq!(err.unwrap_err(), Error::NoEntry);
 
-        f.create(1, OsStr::new(test_file_name), 0, 0);
-        f.setattr(2, new_attrs);
+        assert!(f.create(1, OsStr::new(test_file_name), 0, 0).is_ok());
+        assert!(f.setattr(2, new_attrs).is_ok());
+
         let file_attr = f.getattr(2).unwrap();
         assert_eq!(new_attrs.uid.unwrap(), file_attr.uid);
         assert_eq!(new_attrs.gid.unwrap(), file_attr.gid);
@@ -1352,13 +1454,14 @@ mod test {
             size: Option::None,
             atime: Option::None,
             mtime: Option::None,
+            ctime: Option::None,
             fh: Option::None,
             crtime: Option::None,
             chgtime: Option::None,
             bkuptime: Option::None,
             flags: Option::None,
         };
-        f.setattr(2, new_attrs_none);
+        assert!(f.setattr(2, new_attrs_none).is_ok());
         let file_attr = f.getattr(2).unwrap();
         assert_eq!(new_attrs.uid.unwrap(), file_attr.uid);
         assert_eq!(new_attrs.gid.unwrap(), file_attr.gid);
@@ -1367,25 +1470,34 @@ mod test {
 
     #[test]
     fn memfs_set_get_xattr() {
-        let test_DB_path = "/tmp/test6.db";
+        let test_db_path = "/tmp/test6.db";
         let test_file_name_1 = "testFile";
         let test_file_name_2 = "testFile2";
         let test_file_name_3 = "testFile3";
 
-        fs::remove_file(test_DB_path);
-        let mut f = MemFilesystem::new_path(test_DB_path);
+        match fs::remove_file(test_db_path) {
+            Err(ref e) if e.kind() != std::io::ErrorKind::NotFound => {
+                assert!(false, "{}", e.to_string())
+            }
+            _ => {}
+        }
+        let mut f = MemFilesystem::new_path(test_db_path);
 
         let err = f.setxattr(2, "requires".as_ref(), "3".as_ref());
         assert_eq!(err.unwrap_err(), Error::NoEntry);
 
-        f.create(1, OsStr::new(test_file_name_1), 0, 0);
-        f.create(1, OsStr::new(test_file_name_2), 0, 0);
-        f.setxattr(2, "requires".as_ref(), "3".as_ref());
+        assert!(f.create(1, OsStr::new(test_file_name_1), 0, 0).is_ok());
+        assert!(f.create(1, OsStr::new(test_file_name_2), 0, 0).is_ok());
+        assert!(f
+            .setxattr(2, "requires".as_ref(), test_file_name_2.as_bytes())
+            .is_ok());
         let xattr = f.getxattr(2, "requires".as_ref());
         assert_eq!(test_file_name_2, xattr.unwrap());
 
-        f.create(1, OsStr::new(test_file_name_3), 0, 0);
-        f.setxattr(2, "requires".as_ref(), "4".as_ref());
+        assert!(f.create(1, OsStr::new(test_file_name_3), 0, 0).is_ok());
+        assert!(f
+            .setxattr(2, "requires".as_ref(), test_file_name_3.as_bytes())
+            .is_ok());
         let xattr = f.getxattr(2, "requires".as_ref());
         assert_eq!(
             test_file_name_2.to_owned() + "," + test_file_name_3,
@@ -1402,14 +1514,18 @@ mod test {
 
     #[test]
     fn memfs_structured_files() {
-        let test_DB_path = "/tmp/test7.db";
+        let test_db_path = "/tmp/test7.db";
         let db_file = "db.sql";
-        let db_ = "testFile2";
 
-        fs::remove_file(test_DB_path);
-        let mut f = MemFilesystem::new_path(test_DB_path);
+        match fs::remove_file(test_db_path) {
+            Err(ref e) if e.kind() != std::io::ErrorKind::NotFound => {
+                assert!(false, "{}", e.to_string())
+            }
+            _ => {}
+        }
+        let mut f = MemFilesystem::new_path(test_db_path);
 
-        f.create(1, OsStr::new(db_file), 0, 0);
+        assert!(f.create(1, OsStr::new(db_file), 0, 0).is_ok());
 
         let sql ="\
         BEGIN; \
@@ -1426,23 +1542,28 @@ mod test {
         let err = f.write(2, 0, 0, sql.as_bytes(), 0);
         assert_eq!(err.is_err(), false);
         let csv = f.read(3, 0, 0, 100);
-        assert_eq!(err.is_err(), false);
+        assert_eq!(csv.is_err(), false);
         let l = f.getattr(3);
         assert!(l.unwrap().size > 20);
     }
 
     #[test]
     fn memfs_unlink() {
-        let test_DB_path = "/tmp/test8.db";
+        let test_db_path = "/tmp/test8.db";
         let test_file_name = "testFile";
 
-        fs::remove_file(test_DB_path);
-        let mut f = MemFilesystem::new_path(test_DB_path);
+        match fs::remove_file(test_db_path) {
+            Err(ref e) if e.kind() != std::io::ErrorKind::NotFound => {
+                assert!(false, "{}", e.to_string())
+            }
+            _ => {}
+        }
+        let mut f = MemFilesystem::new_path(test_db_path);
 
         let r = f.unlink(1, test_file_name.as_ref());
         assert_eq!(r.unwrap_err(), Error::NoEntry);
 
-        f.create(1, OsStr::new(test_file_name), 0, 0);
+        assert!(f.create(1, OsStr::new(test_file_name), 0, 0).is_ok());
 
         let r = f.readdir(1, 0);
         assert!(r.is_ok());
@@ -1460,17 +1581,22 @@ mod test {
 
     #[test]
     fn memfs_rmdir() {
-        let test_DB_path = "/tmp/test9.db";
+        let test_db_path = "/tmp/test9.db";
         let test_file_name = "testFile";
         let test_dir_name = "testDir";
 
-        fs::remove_file(test_DB_path);
-        let mut f = MemFilesystem::new_path(test_DB_path);
+        match fs::remove_file(test_db_path) {
+            Err(ref e) if e.kind() != std::io::ErrorKind::NotFound => {
+                assert!(false, "{}", e.to_string())
+            }
+            _ => {}
+        }
+        let mut f = MemFilesystem::new_path(test_db_path);
 
         let r = f.rmdir(1, test_dir_name.as_ref());
         assert_eq!(r.unwrap_err(), Error::NoEntry);
 
-        f.mkdir(1, OsStr::new(test_dir_name), 0);
+        assert!(f.mkdir(1, OsStr::new(test_dir_name), 0).is_ok());
 
         let r = f.readdir(1, 0);
         assert!(r.is_ok());
@@ -1485,7 +1611,7 @@ mod test {
         assert!(r.is_ok());
         assert_eq!(r.unwrap().len(), 2);
 
-        f.mkdir(1, OsStr::new(test_dir_name), 0);
+        assert!(f.mkdir(1, OsStr::new(test_dir_name), 0).is_ok());
 
         let r = f.readdir(1, 0);
         assert!(r.is_ok());
@@ -1493,7 +1619,7 @@ mod test {
         assert_eq!(dir_entries.len(), 3);
         assert_eq!(dir_entries[2].2, test_dir_name);
 
-        f.create(2, test_file_name.as_ref(), 0, 0);
+        assert!(f.create(2, test_file_name.as_ref(), 0, 0).is_ok());
 
         let r = f.readdir(1, 0);
         assert!(r.is_ok());
