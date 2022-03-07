@@ -22,7 +22,7 @@ lob = []
 
 [dependencies]
 log = "0.4"
-fuser = "0.9"
+fuser = "0.11"
 libc = "0.2.42"
 time = "0.1.40"
 regex = "1"
