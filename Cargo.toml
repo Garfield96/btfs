@@ -29,7 +29,7 @@ regex = "1"
 env_logger = "0.8"
 reqwest = {  version = "0.11", features = ["blocking"] }
 postgres = "0.19.1"
-nix = "0.22.0"
+nix = "0.24.0"
 clap = "~2.33"
 
 [dev-dependencies]
